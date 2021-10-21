@@ -1,0 +1,141 @@
+name: Manually deploy a set of artifacts to supplied environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to: [dev, stg, prod-us, prod-eu, prod-au]'
+        required: true
+      commitHash:
+        description: 'short_sha of commit to deploy'
+        required: true
+
+env:
+  GITHUB_PAT: ${{ secrets.SHASTA_GITHUB_PAT }}
+  HELM_REPO: ${{ secrets.SHASTA_HELM_URL }}
+  REPO_NAME: ${{ secrets.SHASTA_HELM_NAME }}
+  CHART_NAME: ${{ secrets.CHART_NAME }}
+  ENVIRONMENT: ${{ github.event.inputs.environment }}
+  COMMIT_HASH: ${{ github.event.inputs.commitHash }}
+  GCP_SA_EMAIL: ${{ secrets.SHASTA_GCP_SA_EMAIL }}
+  GCP_SA_KEY: ${{ secrets.SHASTA_GCP_SA_KEY }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
+  GKE_REGION: ${{ secrets.GKE_REGION }}
+  GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+  GKE_NAMESPACE: ${{ secrets.GKE_NAMESPACE }}
+
+jobs:
+  setEnvironmentContext:
+    runs-on: ubuntu-latest
+    steps:
+    - id: setEnvironmentContext
+      run: echo "::set-output name=environment::${{ env.ENVIRONMENT }}"
+    outputs:
+      environment: ${{ steps.setEnvironmentContext.outputs.environment }}
+      runner: shasta-gh-runner-${{ steps.setEnvironmentContext.outputs.environment }}
+  slack_notify_start:
+    name: Slack Notify Start
+    runs-on: ubuntu-latest
+    steps:
+    - id: slack_notify
+      name: Slack Notify Start
+      uses: peter-evans/repository-dispatch@v1
+      with:
+        token: ${{ env.GITHUB_PAT }}
+        repository: ${{ github.repository }}
+        event-type: slacknotify
+        client-payload: '{"ENVIRONMENT": "${{ env.ENVIRONMENT }}", "SLACK_MESSAGE": "Deployment of \"${{ env.CHART_NAME }}\" to \"${{ env.ENVIRONMENT }}\" has started.", "SLACK_COLOR": "#5081AB" }'
+  deploy:
+    name: Deploy
+    runs-on: ${{ needs.setEnvironmentContext.outputs.runner }}
+    needs: [slack_notify_start, setEnvironmentContext]
+    environment:
+      name: ${{ needs.setEnvironmentContext.outputs.environment }}
+    steps:
+    - id: repo_checkout
+      name: Checkout
+      uses: actions/checkout@v2
+      with:
+        ref: ${{ env.COMMIT_HASH }}
+    - id: generate_helm_package_id
+      name: Generate Helm Package Id
+      run: |
+        export CHART_ID=$(cat helm/${CHART_NAME}/Chart.yaml | grep "version: " | sed -e "s/^version: //")-${COMMIT_HASH::7}
+        echo "Chart Id is: '${CHART_ID}'"
+        echo "::set-output name=chart_id::${CHART_ID}"
+    - id: install_helm
+      name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+        helm plugin install https://github.com/hayorov/helm-gcs || true
+    - id: setup_gcloud
+      name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@master
+      with:
+        project_id: ${{ env.GCP_PROJECT }}
+        service_account_key: ${{ env.GCP_SA_KEY }}
+        export_default_credentials: true
+    - id: setup_cluster_credentials
+      name: Setup Cluster Credentials
+      uses: google-github-actions/get-gke-credentials@main
+      with:
+        cluster_name: ${{ env.GKE_CLUSTER }}
+        location: ${{ env.GKE_REGION }}
+        project_id: ${{ env.GCP_PROJECT }}
+        credentials: ${{ env.GCP_SA_KEY }}
+        use_internal_ip: true
+    - id: pull_config_private_action
+      name: Pull External Config Private Action
+      uses: actions/checkout@v2
+      with:
+        repository: ncr-swt-retail/templated-helm-config-github-action
+        token: ${{ env.GITHUB_PAT }}
+        path: .github/actions/templated-helm-config-github-action
+    - id: generate_env_specific_values
+      name: Generate environment specific values.yaml override
+      uses: ./.github/actions/templated-helm-config-github-action
+      with:
+        config-repo: ncr-swt-retail/shasta-central-config
+        env: ${{ env.ENVIRONMENT }}.yaml
+        pat: ${{ env.GITHUB_PAT }}
+        google-credentials: ${{ env.GCP_SA_KEY }}
+        google-project: ${{ env.GCP_PROJECT }}
+        base-yaml: ./helm/${{ env.CHART_NAME }}/values.yaml
+        app-name: ${{ env.CHART_NAME }}
+    - id: helm_install
+      name: Helm Install/Upgrade
+      run: |
+        helm gcs init $HELM_REPO
+        helm repo add $REPO_NAME $HELM_REPO
+        helm repo update
+        export CHART_ID=${{ steps.generate_helm_package_id.outputs.chart_id }}
+        helm fetch ${REPO_NAME}/${CHART_NAME} --version ${CHART_ID}
+        helm upgrade ${CHART_NAME}-${ENVIRONMENT} ${CHART_NAME}-${CHART_ID}.tgz --install --atomic --namespace ${GKE_NAMESPACE} -f tmp-values.yaml
+  slack_notify_complete:
+    name: Slack Notify Complete
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ needs.deploy.result == 'success'}}
+    steps:
+    - id: slack_notify
+      name: Slack Notify Complete
+      uses: peter-evans/repository-dispatch@v1
+      with:
+        token: ${{ env.GITHUB_PAT }}
+        repository: ${{ github.repository }}
+        event-type: slacknotify
+        client-payload: '{"ENVIRONMENT": "${{ env.ENVIRONMENT }}", "SLACK_MESSAGE": "Deployment of \"${{ env.CHART_NAME }}\" to \"${{ env.ENVIRONMENT }}\" has successfully completed.", "SLACK_COLOR": "#67E98F"}'
+  slack_notify_failure:
+    name: Slack Notify Failure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ always() && needs.deploy.result == 'failure'}}
+    steps:
+    - id: slack_notify
+      name: Slack Notify Complete
+      uses: peter-evans/repository-dispatch@v1
+      with:
+        token: ${{ env.GITHUB_PAT }}
+        repository: ${{ github.repository }}
+        event-type: slacknotify
+        client-payload: '{"ENVIRONMENT": "${{ env.ENVIRONMENT }}", "SLACK_MESSAGE": "Deployment of \"${{ env.CHART_NAME }}\" to \"${{ env.ENVIRONMENT }}\" has failed.", "SLACK_COLOR": "#ED8B84" }'
